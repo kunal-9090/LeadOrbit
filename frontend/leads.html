@@ -135,6 +135,39 @@
         [data-theme='dark'] input[type='date'] {
             color-scheme: dark;
         }
+
+        .dedupe-records {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+            gap: 0.75rem;
+        }
+
+        .dedupe-record {
+            min-width: 0;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            padding: 0.9rem;
+            background: var(--panel);
+        }
+
+        .dedupe-record:has(.dedupe-target:checked) {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 2px var(--focus-ring);
+        }
+
+        .dedupe-value {
+            overflow-wrap: anywhere;
+        }
+
+        .dedupe-fields th:first-child {
+            width: 160px;
+        }
+
+        @media (max-width: 575.98px) {
+            .dedupe-fields th:first-child {
+                width: 105px;
+            }
+        }
     </style>
 </head>
 
@@ -199,6 +232,9 @@
                         <button id="filter-toggle-btn" class="btn btn-sm btn-outline-secondary btn-filter-toggle" aria-label="Toggle filters" title="Filters">
                             <i class="bi bi-funnel me-1" aria-hidden="true"></i>Filters
                             <span class="filter-dot" id="filter-active-dot" aria-hidden="true"></span>
+                        </button>
+                        <button id="deduplicate-btn" class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#deduplicateModal">
+                            <i class="bi bi-intersect me-1" aria-hidden="true"></i> Deduplicate
                         </button>
                         <button class="btn btn-sm btn-primary" data-bs-toggle="modal" data-bs-target="#uploadModal">
                             <i class="bi bi-upload me-1" aria-hidden="true"></i> Import CSV
@@ -445,6 +481,38 @@
         </div>
     </div>
 
+    <div class="modal fade" id="deduplicateModal" tabindex="-1" aria-labelledby="deduplicateModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-xl modal-dialog-scrollable">
+            <div class="modal-content rounded-3 shadow">
+                <div class="modal-header border-0">
+                    <div>
+                        <h5 class="modal-title fw-bold" id="deduplicateModalLabel">Review duplicate leads</h5>
+                        <div class="text-muted small">Choose the record and field values to keep.</div>
+                    </div>
+                    <div class="d-flex flex-wrap align-items-center justify-content-end gap-2">
+                        <button type="button" class="btn btn-sm btn-outline-secondary" id="refresh-duplicates-btn" title="Refresh duplicate groups" aria-label="Refresh duplicate groups">
+                            <i class="bi bi-arrow-clockwise" aria-hidden="true"></i>
+                        </button>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                </div>
+                <div class="modal-body" id="deduplicate-body" aria-live="polite">
+                    <div class="text-center py-5 text-muted">
+                        <div class="spinner-border spinner-border-sm text-primary me-2" role="status" aria-label="Loading duplicate leads"></div>
+                        Scanning leads...
+                    </div>
+                </div>
+                <div class="modal-footer border-0">
+                    <div id="deduplicate-status" class="small me-auto" role="status"></div>
+                    <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-primary" id="merge-duplicates-btn" disabled>
+                        <i class="bi bi-intersect me-1" aria-hidden="true"></i> Merge selected records
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script type="module" src="./main.js"></script>
     <script type="module">
         import { fetchWithAuth } from './api.js';
@@ -455,6 +523,8 @@
         let allImportJobs = [];      // import job history
         let selectedTagIds = new Set(); // tags selected in the filter panel
         let activeFilters = {};      // last applied filter state
+        let duplicateGroups = [];
+        let selectedDuplicateGroupIndex = 0;
 
         // ─── Utilities ──────────────────────────────────────────────────────
 
@@ -507,6 +577,18 @@
                 icon.classList.replace('bi-clipboard', 'bi-check');
                 setTimeout(() => icon.classList.replace('bi-check', 'bi-clipboard'), 2000);
             });
+        }
+
+        function leadDisplayName(lead) {
+            const name = `${lead.first_name || ''} ${lead.last_name || ''}`.trim();
+            return name || lead.email || 'Unnamed lead';
+        }
+
+        function readApiError(payload, fallback) {
+            if (payload?.detail) return payload.detail;
+            const firstValue = payload && Object.values(payload)[0];
+            if (Array.isArray(firstValue)) return firstValue.join(' ');
+            return typeof firstValue === 'string' ? firstValue : fallback;
         }
 
         // ─── Render ─────────────────────────────────────────────────────────
@@ -633,6 +715,174 @@
                 ? (leads.reduce((sum, l) => sum + Number(l.score || 0), 0) / leads.length).toFixed(1)
                 : '0.0';
             document.getElementById('avg-score').textContent = avgScore;
+        }
+
+        function renderDuplicateWorkspace() {
+            const body = document.getElementById('deduplicate-body');
+            const mergeButton = document.getElementById('merge-duplicates-btn');
+            const status = document.getElementById('deduplicate-status');
+            status.textContent = '';
+
+            if (!duplicateGroups.length) {
+                mergeButton.disabled = true;
+                body.innerHTML = `
+                    <div class="text-center py-5">
+                        <i class="bi bi-check2-circle display-5 text-success" aria-hidden="true"></i>
+                        <h6 class="mt-3 mb-1">No duplicate groups found</h6>
+                        <div class="text-muted small">Your lead list is already clean.</div>
+                    </div>`;
+                return;
+            }
+
+            const group = duplicateGroups[selectedDuplicateGroupIndex];
+            const suggestedId = String(group.suggested_target_id);
+            const fields = [
+                ['email', 'Email'],
+                ['first_name', 'First name'],
+                ['last_name', 'Last name'],
+                ['company', 'Company'],
+                ['phone', 'Phone'],
+                ['linkedin_url', 'LinkedIn'],
+            ];
+            const reasonLabels = {
+                matching_domain: 'Matching email domain',
+                similar_name: 'Similar name',
+            };
+
+            const groupPicker = duplicateGroups.length > 1 ? `
+                <div class="mb-3">
+                    <label for="duplicate-group-select" class="form-label fw-semibold">Duplicate group</label>
+                    <select class="form-select" id="duplicate-group-select">
+                        ${duplicateGroups.map((item, index) => `
+                            <option value="${index}"${index === selectedDuplicateGroupIndex ? ' selected' : ''}>
+                                Group ${index + 1} - ${item.leads.length} records
+                            </option>`).join('')}
+                    </select>
+                </div>` : '';
+
+            const records = group.leads.map(lead => {
+                const isSuggested = String(lead.id) === suggestedId;
+                return `
+                    <div class="dedupe-record">
+                        <div class="form-check mb-3">
+                            <input class="form-check-input dedupe-target" type="radio" name="dedupe-target" id="target-${lead.id}" value="${lead.id}"${isSuggested ? ' checked' : ''}>
+                            <label class="form-check-label fw-bold" for="target-${lead.id}">Keep as target</label>
+                            ${isSuggested ? '<span class="badge text-bg-primary ms-1">Suggested</span>' : ''}
+                        </div>
+                        <div class="fw-semibold dedupe-value mb-2">${escapeHtml(leadDisplayName(lead))}</div>
+                        <dl class="small mb-0">
+                            <dt class="text-muted fw-medium">Email</dt><dd class="dedupe-value">${escapeHtml(lead.email) || '-'}</dd>
+                            <dt class="text-muted fw-medium">Company</dt><dd class="dedupe-value">${escapeHtml(lead.company) || '-'}</dd>
+                            <dt class="text-muted fw-medium">Phone</dt><dd class="dedupe-value">${escapeHtml(lead.phone) || '-'}</dd>
+                            <dt class="text-muted fw-medium">LinkedIn</dt><dd class="dedupe-value mb-0">${escapeHtml(lead.linkedin_url) || '-'}</dd>
+                        </dl>
+                    </div>`;
+            }).join('');
+
+            const fieldRows = fields.map(([field, label]) => {
+                const preferredLead = group.leads.find(lead => String(lead.id) === suggestedId && lead[field])
+                    || group.leads.find(lead => lead[field])
+                    || group.leads[0];
+                return `
+                    <tr>
+                        <th scope="row">${label}</th>
+                        <td>
+                            <select class="form-select form-select-sm dedupe-field-source" data-field="${field}" aria-label="Choose ${label} value">
+                                ${group.leads.map(lead => `
+                                    <option value="${lead.id}"${lead.id === preferredLead.id ? ' selected' : ''}>
+                                        ${escapeHtml(lead[field]) || '(empty)'} - ${escapeHtml(leadDisplayName(lead))}
+                                    </option>`).join('')}
+                            </select>
+                        </td>
+                    </tr>`;
+            }).join('');
+
+            body.innerHTML = `
+                ${groupPicker}
+                <div class="d-flex flex-wrap align-items-center gap-2 mb-3">
+                    <span class="fw-semibold">${group.leads.length} possible duplicates</span>
+                    <span class="badge text-bg-secondary">${Math.round(Number(group.confidence || 0) * 100)}% confidence</span>
+                    ${(group.reasons || []).map(reason => `<span class="badge text-bg-light border">${escapeHtml(reasonLabels[reason] || reason)}</span>`).join('')}
+                </div>
+                <div class="dedupe-records mb-4">${records}</div>
+                <h6 class="mb-2">Field values to keep</h6>
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle dedupe-fields mb-2">
+                        <tbody>${fieldRows}</tbody>
+                    </table>
+                </div>
+                <div class="text-muted small">Tags, highest score, unsubscribe status, and campaign activity are preserved automatically.</div>`;
+
+            mergeButton.disabled = false;
+            document.getElementById('duplicate-group-select')?.addEventListener('change', event => {
+                selectedDuplicateGroupIndex = Number(event.target.value);
+                renderDuplicateWorkspace();
+            });
+        }
+
+        async function loadDuplicateGroups() {
+            const body = document.getElementById('deduplicate-body');
+            const mergeButton = document.getElementById('merge-duplicates-btn');
+            mergeButton.disabled = true;
+            body.innerHTML = '<div class="text-center py-5 text-muted"><span class="spinner-border spinner-border-sm text-primary me-2" aria-hidden="true"></span>Scanning leads...</div>';
+
+            try {
+                const response = await fetchWithAuth('/leads/duplicates/');
+                const payload = await response.json().catch(() => ({}));
+                if (!response.ok) throw new Error(readApiError(payload, 'Could not scan duplicate leads.'));
+                duplicateGroups = payload.groups || [];
+                selectedDuplicateGroupIndex = Math.min(selectedDuplicateGroupIndex, Math.max(duplicateGroups.length - 1, 0));
+                renderDuplicateWorkspace();
+            } catch (error) {
+                duplicateGroups = [];
+                body.innerHTML = `<div class="alert alert-danger mb-0">${escapeHtml(error.message)}</div>`;
+            }
+        }
+
+        async function mergeSelectedDuplicates() {
+            const group = duplicateGroups[selectedDuplicateGroupIndex];
+            const target = document.querySelector('.dedupe-target:checked');
+            if (!group || !target) return;
+
+            const targetId = target.value;
+            const duplicateIds = group.leads
+                .map(lead => String(lead.id))
+                .filter(leadId => leadId !== targetId);
+            const fieldSources = Object.fromEntries(
+                [...document.querySelectorAll('.dedupe-field-source')]
+                    .map(select => [select.dataset.field, select.value])
+            );
+
+            if (!window.confirm(`Merge ${duplicateIds.length} duplicate record(s) into the selected target?`)) return;
+
+            const button = document.getElementById('merge-duplicates-btn');
+            const status = document.getElementById('deduplicate-status');
+            button.disabled = true;
+            button.innerHTML = '<span class="spinner-border spinner-border-sm me-1" aria-hidden="true"></span> Merging...';
+            status.textContent = '';
+
+            try {
+                const response = await fetchWithAuth('/leads/merge/', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        target_id: targetId,
+                        duplicate_ids: duplicateIds,
+                        field_sources: fieldSources,
+                    }),
+                });
+                const payload = await response.json().catch(() => ({}));
+                if (!response.ok) throw new Error(readApiError(payload, 'Could not merge duplicate leads.'));
+
+                await loadLeads();
+                await loadDuplicateGroups();
+                status.innerHTML = `<span class="text-success"><i class="bi bi-check-circle me-1" aria-hidden="true"></i>${escapeHtml(payload.message)}</span>`;
+            } catch (error) {
+                status.innerHTML = `<span class="text-danger">${escapeHtml(error.message)}</span>`;
+            } finally {
+                button.innerHTML = '<i class="bi bi-intersect me-1" aria-hidden="true"></i> Merge selected records';
+                button.disabled = duplicateGroups.length === 0;
+            }
         }
 
         // ─── Filter Panel ────────────────────────────────────────────────────
@@ -826,6 +1076,9 @@
 
             document.getElementById('lead-search').addEventListener('input', applySearch);
             document.getElementById('refresh-history-btn').addEventListener('click', loadImportHistory);
+            document.getElementById('deduplicateModal').addEventListener('show.bs.modal', loadDuplicateGroups);
+            document.getElementById('refresh-duplicates-btn').addEventListener('click', loadDuplicateGroups);
+            document.getElementById('merge-duplicates-btn').addEventListener('click', mergeSelectedDuplicates);
 
             const filterPanel = document.getElementById('filter-panel');
             document.getElementById('filter-toggle-btn').addEventListener('click', () => {

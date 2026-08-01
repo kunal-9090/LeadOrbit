@@ -1,7 +1,7 @@
-from rest_framework import serializers
 from django.core.exceptions import ValidationError as DjangoValidationError
+from rest_framework import serializers
 
-from .models import BlockedDomain, Lead, LeadImportJob, Tag, LeadTag, validate_domain
+from .models import BlockedDomain, Lead, LeadImportJob, LeadTag, Tag, validate_domain
 
 
 class TagSerializer(serializers.ModelSerializer):
@@ -61,6 +61,56 @@ class LeadSerializer(serializers.ModelSerializer):
             self._set_tags(lead, tag_ids)
         return lead
 
+
+class LeadMergeSerializer(serializers.Serializer):
+    target_id = serializers.UUIDField()
+    duplicate_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        allow_empty=False,
+    )
+    field_sources = serializers.DictField(
+        child=serializers.UUIDField(),
+        required=False,
+        default=dict,
+    )
+
+    def validate(self, attrs):
+        target_id = attrs['target_id']
+        duplicate_ids = attrs['duplicate_ids']
+        field_sources = attrs['field_sources']
+
+        if len(duplicate_ids) != len(set(duplicate_ids)):
+            raise serializers.ValidationError({
+                'duplicate_ids': 'Duplicate lead IDs are not allowed.',
+            })
+        if target_id in duplicate_ids:
+            raise serializers.ValidationError({
+                'duplicate_ids': 'The target lead cannot also be a duplicate.',
+            })
+
+        selected_ids = {target_id, *duplicate_ids}
+        invalid_fields = set(field_sources) - {
+            'email',
+            'first_name',
+            'last_name',
+            'company',
+            'phone',
+            'linkedin_url',
+        }
+        if invalid_fields:
+            raise serializers.ValidationError({
+                'field_sources': (
+                    f'Unsupported fields: {", ".join(sorted(invalid_fields))}.'
+                ),
+            })
+        if any(source_id not in selected_ids for source_id in field_sources.values()):
+            raise serializers.ValidationError({
+                'field_sources': (
+                    'Every field source must be one of the selected leads.'
+                ),
+            })
+
+        return attrs
 
 class LeadImportJobSerializer(serializers.ModelSerializer):
     class Meta:

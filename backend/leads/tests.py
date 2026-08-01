@@ -1,12 +1,15 @@
-from django.core.files.uploadedfile import SimpleUploadedFile
+from unittest.mock import patch
+
+from campaigns.models import Campaign, CampaignLead, SequenceStep
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
-
-from leads.models import BlockedDomain, Lead, Tag, LeadTag, LeadImportJob
-from leads.tasks import import_leads_from_csv
 from tenants.models import Organization
 from users.models import User
 
+from leads.models import BlockedDomain, Lead, LeadImportJob, LeadTag, Tag
+from leads.services import merge_leads
+from leads.tasks import import_leads_from_csv
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -461,3 +464,258 @@ class LeadFilterTests(APITestCase):
         resp = self._get()
         emails = {l['email'] for l in resp.data}
         self.assertNotIn('spy@example.com', emails)
+
+
+class LeadDeduplicationTests(APITestCase):
+    def setUp(self):
+        self.org = Organization.objects.create(name='Merge Org')
+        self.other_org = Organization.objects.create(name='Other Merge Org')
+        self.admin = _make_user(self.org, email='merge-admin@example.com')
+        self.member = User.objects.create_user(
+            email='merge-member@example.com',
+            password='StrongPass123!',
+            organization=self.org,
+            role=User.ROLE_MEMBER,
+        )
+
+    def test_duplicate_discovery_is_tenant_scoped_and_ignores_public_domains(self):
+        acme_a = _make_lead(
+            self.org,
+            'alice@acme.test',
+            first_name='Alice',
+            last_name='Cole',
+        )
+        acme_b = _make_lead(
+            self.org,
+            'billing@acme.test',
+            first_name='Billing',
+            last_name='Desk',
+        )
+        jon = _make_lead(
+            self.org,
+            'jon@gmail.com',
+            first_name='Jon',
+            last_name='Smith',
+        )
+        john = _make_lead(
+            self.org,
+            'john@gmail.com',
+            first_name='John',
+            last_name='Smith',
+        )
+        _make_lead(
+            self.org,
+            'unrelated@gmail.com',
+            first_name='Unrelated',
+            last_name='Person',
+        )
+        _make_lead(
+            self.other_org,
+            'private@acme.test',
+            first_name='Hidden',
+            last_name='Lead',
+        )
+
+        self.client.force_authenticate(self.admin)
+        response = self.client.get('/api/v1/leads/duplicates/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        groups = response.data['groups']
+        self.assertEqual(response.data['count'], 2)
+        grouped_ids = [{lead['id'] for lead in group['leads']} for group in groups]
+        self.assertIn({str(acme_a.id), str(acme_b.id)}, grouped_ids)
+        self.assertIn({str(jon.id), str(john.id)}, grouped_ids)
+        all_emails = {lead['email'] for group in groups for lead in group['leads']}
+        self.assertNotIn('private@acme.test', all_emails)
+        self.assertNotIn('unrelated@gmail.com', all_emails)
+
+    def test_merge_preserves_fields_tags_unsubscribe_and_campaign_history(self):
+        target = _make_lead(
+            self.org,
+            'primary@acme.test',
+            first_name='Ada',
+            last_name='Lovelace',
+            custom_data={'source': 'target', 'target_only': True},
+            custom_variables={'region': 'west'},
+            score=20,
+        )
+        source = _make_lead(
+            self.org,
+            'duplicate@acme.test',
+            first_name='A.',
+            last_name='Lovelace',
+            company='Analytical Engines',
+            phone='+44 1000',
+            custom_data={'source': 'duplicate', 'duplicate_only': True},
+            custom_variables={'region': 'east', 'role': 'Founder'},
+            global_unsubscribe=True,
+            score=80,
+        )
+        vip = _make_tag(self.org, 'VIP')
+        founder = _make_tag(self.org, 'Founder')
+        LeadTag.objects.create(organization=self.org, lead=target, tag=vip)
+        LeadTag.objects.create(organization=self.org, lead=source, tag=founder)
+
+        shared_campaign = Campaign.objects.create(organization=self.org, name='Shared')
+        shared_step = SequenceStep.objects.create(
+            organization=self.org,
+            campaign=shared_campaign,
+            step_order=2,
+            channel_type='EMAIL',
+        )
+        CampaignLead.objects.create(
+            organization=self.org,
+            campaign=shared_campaign,
+            lead=target,
+            status='ENROLLED',
+        )
+        clicked_at = timezone.now()
+        CampaignLead.objects.create(
+            organization=self.org,
+            campaign=shared_campaign,
+            lead=source,
+            current_step=shared_step,
+            status='REPLIED',
+            last_clicked_at=clicked_at,
+        )
+
+        source_only_campaign = Campaign.objects.create(
+            organization=self.org,
+            name='Source only',
+        )
+        CampaignLead.objects.create(
+            organization=self.org,
+            campaign=source_only_campaign,
+            lead=source,
+            status='ACTIVE',
+        )
+
+        self.client.force_authenticate(self.admin)
+        response = self.client.post(
+            '/api/v1/leads/merge/',
+            {
+                'target_id': str(target.id),
+                'duplicate_ids': [str(source.id)],
+                'field_sources': {
+                    'company': str(source.id),
+                    'phone': str(source.id),
+                },
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(Lead.objects.filter(id=source.id).exists())
+        target.refresh_from_db()
+        self.assertEqual(target.company, 'Analytical Engines')
+        self.assertEqual(target.phone, '+44 1000')
+        self.assertEqual(target.score, 80)
+        self.assertTrue(target.global_unsubscribe)
+        self.assertEqual(target.custom_data['source'], 'target')
+        self.assertTrue(target.custom_data['duplicate_only'])
+        self.assertEqual(target.custom_variables, {'region': 'west', 'role': 'Founder'})
+        self.assertEqual(
+            set(
+                LeadTag.objects.filter(lead=target).values_list(
+                    'tag__name',
+                    flat=True,
+                )
+            ),
+            {'VIP', 'Founder'},
+        )
+
+        shared_record = CampaignLead.objects.get(campaign=shared_campaign, lead=target)
+        self.assertEqual(shared_record.status, 'REPLIED')
+        self.assertEqual(shared_record.current_step, shared_step)
+        self.assertEqual(shared_record.last_clicked_at, clicked_at)
+        self.assertTrue(
+            CampaignLead.objects.filter(
+                campaign=source_only_campaign,
+                lead=target,
+            ).exists()
+        )
+        self.assertEqual(response.data['campaign_records_collapsed'], 1)
+        self.assertEqual(response.data['campaign_records_moved'], 1)
+
+    def test_merge_rolls_back_when_campaign_history_merge_fails(self):
+        target = _make_lead(self.org, 'target@acme.test')
+        source = _make_lead(self.org, 'source@acme.test')
+        campaign = Campaign.objects.create(organization=self.org, name='Rollback')
+        CampaignLead.objects.create(
+            organization=self.org,
+            campaign=campaign,
+            lead=target,
+        )
+        CampaignLead.objects.create(
+            organization=self.org,
+            campaign=campaign,
+            lead=source,
+        )
+
+        with patch(
+            'leads.services._merge_campaign_lead',
+            side_effect=RuntimeError('forced failure'),
+        ):
+            with self.assertRaises(RuntimeError):
+                merge_leads(self.org, target.id, [source.id])
+
+        self.assertTrue(Lead.objects.filter(id=target.id).exists())
+        self.assertTrue(Lead.objects.filter(id=source.id).exists())
+        self.assertEqual(
+            CampaignLead.objects.filter(campaign=campaign).count(),
+            2,
+        )
+
+    def test_merge_rejects_cross_tenant_lead_without_mutating_records(self):
+        target = _make_lead(self.org, 'target@acme.test')
+        foreign = _make_lead(self.other_org, 'foreign@acme.test')
+        self.client.force_authenticate(self.admin)
+
+        response = self.client.post(
+            '/api/v1/leads/merge/',
+            {
+                'target_id': str(target.id),
+                'duplicate_ids': [str(foreign.id)],
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertTrue(Lead.objects.filter(id=target.id).exists())
+        self.assertTrue(Lead.objects.filter(id=foreign.id).exists())
+
+    def test_member_cannot_merge_leads(self):
+        target = _make_lead(self.org, 'target@acme.test')
+        source = _make_lead(self.org, 'source@acme.test')
+        self.client.force_authenticate(self.member)
+
+        response = self.client.post(
+            '/api/v1/leads/merge/',
+            {
+                'target_id': str(target.id),
+                'duplicate_ids': [str(source.id)],
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(Lead.objects.filter(id=source.id).exists())
+
+    def test_merge_rejects_field_source_outside_selection(self):
+        target = _make_lead(self.org, 'target@acme.test')
+        source = _make_lead(self.org, 'source@acme.test')
+        unselected = _make_lead(self.org, 'unselected@other.test')
+        self.client.force_authenticate(self.admin)
+
+        response = self.client.post(
+            '/api/v1/leads/merge/',
+            {
+                'target_id': str(target.id),
+                'duplicate_ids': [str(source.id)],
+                'field_sources': {'company': str(unselected.id)},
+            },
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertTrue(Lead.objects.filter(id=source.id).exists())

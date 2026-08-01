@@ -1,11 +1,19 @@
 from django.db.models import Q
-from rest_framework import viewsets, parsers, status
-from rest_framework.pagination import PageNumberPagination
+from rest_framework import parsers, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 from users.permissions import IsOrgManager
-from .models import BlockedDomain, Lead, LeadImportJob, Tag, LeadTag
-from .serializers import BlockedDomainSerializer, LeadImportJobSerializer, LeadSerializer, TagSerializer
+
+from .models import BlockedDomain, Lead, LeadImportJob, LeadTag, Tag
+from .serializers import (
+    BlockedDomainSerializer,
+    LeadImportJobSerializer,
+    LeadMergeSerializer,
+    LeadSerializer,
+    TagSerializer,
+)
+from .services import find_duplicate_groups, merge_leads
 
 
 class LeadImportJobPagination(PageNumberPagination):
@@ -23,6 +31,7 @@ class LeadViewSet(viewsets.ModelViewSet):
         'delete_all',
         'import_csv',
         'assign_tags',
+        'merge',
     })
 
     def get_permissions(self):
@@ -151,6 +160,46 @@ class LeadViewSet(viewsets.ModelViewSet):
         # Return the updated tag list
         updated_tags = Tag.objects.filter(tagged_leads__lead=lead)
         return Response(TagSerializer(updated_tags, many=True).data, status=status.HTTP_200_OK)
+
+    @action(detail=False, methods=['get'], url_path='duplicates')
+    def duplicates(self, request):
+        groups = find_duplicate_groups(self.get_queryset())
+        payload = []
+        for index, group in enumerate(groups, start=1):
+            payload.append({
+                'group_id': f'duplicate-group-{index}',
+                'reasons': group['reasons'],
+                'confidence': group['confidence'],
+                'suggested_target_id': str(group['suggested_target_id']),
+                'leads': LeadSerializer(group['leads'], many=True).data,
+            })
+        return Response({'count': len(payload), 'groups': payload})
+
+    @action(detail=False, methods=['post'], url_path='merge')
+    def merge(self, request):
+        serializer = LeadMergeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            result = merge_leads(
+                organization=request.user.organization,
+                **serializer.validated_data,
+            )
+        except Lead.DoesNotExist as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({
+            'message': (
+                f'Successfully merged {len(result["merged_ids"])} '
+                'duplicate lead(s).'
+            ),
+            'merged_lead': LeadSerializer(result['lead']).data,
+            'merged_ids': [str(lead_id) for lead_id in result['merged_ids']],
+            'campaign_records_moved': result['campaign_records_moved'],
+            'campaign_records_collapsed': result['campaign_records_collapsed'],
+        })
 
 
 class LeadImportJobViewSet(viewsets.ReadOnlyModelViewSet):
